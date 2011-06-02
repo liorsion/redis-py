@@ -1,39 +1,27 @@
 import datetime
-import threading
 import time
 import warnings
-from itertools import chain, imap, islice, izip
-from redis.connection import ConnectionPool, Connection
+from itertools import imap, izip, starmap
+from redis.connection import ConnectionPool, UnixDomainSocketConnection
 from redis.exceptions import (
-    AuthenticationError,
     ConnectionError,
     DataError,
-    PubSubError,
     RedisError,
     ResponseError,
     WatchError,
 )
 
-
-def list_or_args(command, keys, args):
+def list_or_args(keys, args):
     # returns a single list combining keys and args
-    # if keys is not a list or args has items, issue a
-    # deprecation warning
-    oldapi = bool(args)
     try:
         i = iter(keys)
         # a string can be iterated, but indicates
         # keys wasn't passed as a list
         if isinstance(keys, basestring):
-            oldapi = True
+            keys = [keys]
     except TypeError:
-        oldapi = True
         keys = [keys]
-    if oldapi:
-        warnings.warn(DeprecationWarning(
-            "Passing *args to Redis.%s has been deprecated. "
-            "Pass an iterable to ``keys`` instead" % command
-        ))
+    if args:
         keys.extend(args)
     return keys
 
@@ -122,7 +110,7 @@ def parse_config(response, **options):
         return response and pairs_to_dict(response) or {}
     return response == 'OK'
 
-class Redis(threading.local):
+class Redis(object):
     """
     Implementation of the Redis protocol.
 
@@ -178,49 +166,51 @@ class Redis(threading.local):
         }
         )
 
-    # commands that should NOT pull data off the network buffer when executed
-    SUBSCRIPTION_COMMANDS = set([
-        'SUBSCRIBE', 'UNSUBSCRIBE', 'PSUBSCRIBE', 'PUNSUBSCRIBE'
-        ])
-
     def __init__(self, host='localhost', port=6379,
                  db=0, password=None, socket_timeout=None,
                  connection_pool=None,
-                 charset='utf-8', errors='strict'):
-        self.encoding = charset
-        self.errors = errors
-        self.connection = None
-        self.subscribed = False
-        self.connection_pool = connection_pool and connection_pool or ConnectionPool()
-        self.select(db, host, port, password, socket_timeout)
+                 charset='utf-8', errors='strict', unix_socket_path=None):
+        if not connection_pool:
+            kwargs = {
+                'db': db,
+                'password': password,
+                'socket_timeout': socket_timeout,
+                'encoding': charset,
+                'encoding_errors': errors
+                }
+            # based on input, setup appropriate connection args
+            if unix_socket_path:
+                kwargs.update({
+                    'path': unix_socket_path,
+                    'connection_class': UnixDomainSocketConnection
+                })
+            else:
+                kwargs.update({
+                    'host': host,
+                    'port': port
+                })
+            connection_pool = ConnectionPool(**kwargs)
+        self.connection_pool = connection_pool
 
-    #### Legacty accessors of connection information ####
-    def _get_host(self):
-        return self.connection.host
-    host = property(_get_host)
+        self.response_callbacks = self.__class__.RESPONSE_CALLBACKS.copy()
 
-    def _get_port(self):
-        return self.connection.port
-    port = property(_get_port)
+    def set_response_callback(self, command, callback):
+        "Set a custom Response Callback"
+        self.response_callbacks[command] = callback
 
-    def _get_db(self):
-        return self.connection.db
-    db = property(_get_db)
-
-    def pipeline(self, transaction=True):
+    def pipeline(self, transaction=True, shard_hint=None):
         """
         Return a new pipeline object that can queue multiple commands for
         later execution. ``transaction`` indicates whether all commands
-        should be executed atomically. Apart from multiple atomic operations,
-        pipelines are useful for batch loading of data as they reduce the
-        number of back and forth network operations between client and server.
+        should be executed atomically. Apart from making a group of operations
+        atomic, pipelines are useful for reducing the back-and-forth overhead
+        between the client and server.
         """
         return Pipeline(
-            self.connection,
+            self.connection_pool,
+            self.response_callbacks,
             transaction,
-            self.encoding,
-            self.errors
-            )
+            shard_hint)
 
     def lock(self, name, timeout=None, sleep=0.1):
         """
@@ -236,109 +226,36 @@ class Redis(threading.local):
         """
         return Lock(self, name, timeout=timeout, sleep=sleep)
 
+    def pubsub(self, shard_hint=None):
+        """
+        Return a Publish/Subscribe object. With this object, you can
+        subscribe to channels and listen for messages that get published to
+        them.
+        """
+        return PubSub(self.connection_pool, shard_hint)
+
     #### COMMAND EXECUTION AND PROTOCOL PARSING ####
-    def _execute_command(self, command_name, command, **options):
-        subscription_command = command_name in self.SUBSCRIPTION_COMMANDS
-        if self.subscribed and not subscription_command:
-            raise PubSubError("Cannot issue commands other than SUBSCRIBE and "
-                              "UNSUBSCRIBE while channels are open")
-        try:
-            self.connection.send(command, self)
-            if subscription_command:
-                return None
-            return self.parse_response(command_name, **options)
-        except ConnectionError:
-            self.connection.disconnect()
-            self.connection.send(command, self)
-            if subscription_command:
-                return None
-            return self.parse_response(command_name, **options)
-
     def execute_command(self, *args, **options):
-        "Sends the command to the redis server and returns it's response"
-        cmds = ['$%s\r\n%s\r\n' % (len(enc_value), enc_value)
-                for enc_value in imap(self.encode, args)]
-        return self._execute_command(
-            args[0],
-            '*%s\r\n%s' % (len(cmds), ''.join(cmds)),
-            **options
-            )
-
-    def parse_response(self, command_name, catch_errors=False, **options):
-        "Parses a response from the Redis server"
-        response = self.connection.read_response(command_name, catch_errors)
-        if command_name in self.RESPONSE_CALLBACKS:
-            return self.RESPONSE_CALLBACKS[command_name](response, **options)
-        return response
-
-    def encode(self, value):
-        "Encode ``value`` using the instance's charset"
-        if isinstance(value, str):
-            return value
-        if isinstance(value, unicode):
-            return value.encode(self.encoding, self.errors)
-        # not a string or unicode, attempt to convert to a string
-        return str(value)
-
-    #### CONNECTION HANDLING ####
-    def get_connection(self, host, port, db, password, socket_timeout):
-        "Returns a connection object"
-        conn = self.connection_pool.get_connection(
-            host, port, db, password, socket_timeout)
-        # if for whatever reason the connection gets a bad password, make
-        # sure a subsequent attempt with the right password makes its way
-        # to the connection
-        conn.password = password
-        return conn
-
-    def _setup_connection(self):
-        """
-        After successfully opening a socket to the Redis server, the
-        connection object calls this method to authenticate and select
-        the appropriate database.
-        """
-        self.subscribed = False
-        if self.connection.password:
-            if not self.execute_command('AUTH', self.connection.password):
-                raise AuthenticationError("Invalid Password")
-        self.execute_command('SELECT', self.connection.db)
-
-    def select(self, db, host=None, port=None, password=None,
-            socket_timeout=None):
-        """
-        Switch to a different Redis connection.
-
-        If the host and port aren't provided and there's an existing
-        connection, use the existing connection's host and port instead.
-
-        Note this method actually replaces the underlying connection object
-        prior to issuing the SELECT command.  This makes sure we protect
-        the thread-safe connections
-        """
-        if host is None:
-            if self.connection is None:
-                raise RedisError("A valid hostname or IP address "
-                    "must be specified")
-            host = self.connection.host
-        if port is None:
-            if self.connection is None:
-                raise RedisError("A valid port must be specified")
-            port = self.connection.port
-
-        self.connection = self.get_connection(
-            host, port, db, password, socket_timeout)
-
-    def shutdown(self):
-        "Shutdown the server"
-        if self.subscribed:
-            raise PubSubError("Can't call 'shutdown' when 'subscribed'")
+        "Execute a command and return a parsed response"
+        pool = self.connection_pool
+        command_name = args[0]
+        connection = pool.get_connection(command_name, **options)
         try:
-            self.execute_command('SHUTDOWN')
+            connection.send_command(*args)
+            return self.parse_response(connection, command_name, **options)
         except ConnectionError:
-            # a ConnectionError here is expected
-            return
-        raise RedisError("SHUTDOWN seems to have failed.")
+            connection.disconnect()
+            connection.send_command(*args)
+            return self.parse_response(connection, command_name, **options)
+        finally:
+            pool.release(connection)
 
+    def parse_response(self, connection, command_name, **options):
+        "Parses a response from the Redis server"
+        response = connection.read_response()
+        if command_name in self.response_callbacks:
+            return self.response_callbacks[command_name](response, **options)
+        return response
 
     #### SERVER INFORMATION ####
     def bgrewriteaof(self):
@@ -369,14 +286,6 @@ class Redis(threading.local):
         return self.execute_command('DEL', *names)
     __delitem__ = delete
 
-    def flush(self, all_dbs=False):
-        warnings.warn(DeprecationWarning(
-            "'flush' has been deprecated. "
-            "Use Redis.flushdb() or Redis.flushall() instead"))
-        if all_dbs:
-            return self.flushall()
-        return self.flushdb()
-
     def flushall(self):
         "Delete all keys in all databases on the current host"
         return self.execute_command('FLUSHALL')
@@ -406,6 +315,15 @@ class Redis(threading.local):
         blocking until the save is complete
         """
         return self.execute_command('SAVE')
+
+    def shutdown(self):
+        "Shutdown the server"
+        try:
+            self.execute_command('SHUTDOWN')
+        except ConnectionError:
+            # a ConnectionError here is expected
+            return
+        raise RedisError("SHUTDOWN seems to have failed.")
 
     def slaveof(self, host=None, port=None):
         """
@@ -465,8 +383,7 @@ class Redis(threading.local):
         value = self.get(name)
         if value:
             return value
-        else:
-            raise KeyError(name)
+        raise KeyError(name)
 
     def getbit(self, name, offset):
         "Returns a boolean indicating the value of ``offset`` in ``name``"
@@ -493,10 +410,8 @@ class Redis(threading.local):
     def mget(self, keys, *args):
         """
         Returns a list of values ordered identically to ``keys``
-
-        * Passing *args to this method has been deprecated *
         """
-        keys = list_or_args('mget', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('MGET', *keys)
 
     def mset(self, mapping):
@@ -528,51 +443,18 @@ class Redis(threading.local):
         "Returns the name of a random key"
         return self.execute_command('RANDOMKEY')
 
-    def rename(self, src, dst, **kwargs):
+    def rename(self, src, dst):
         """
         Rename key ``src`` to ``dst``
-
-        * The following flags have been deprecated *
-        If ``preserve`` is True, rename the key only if the destination name
-            doesn't already exist
         """
-        if kwargs:
-            if 'preserve' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "preserve option to 'rename' is deprecated, "
-                    "use Redis.renamenx instead"))
-                if kwargs['preserve']:
-                    return self.renamenx(src, dst)
         return self.execute_command('RENAME', src, dst)
 
     def renamenx(self, src, dst):
         "Rename key ``src`` to ``dst`` if ``dst`` doesn't already exist"
         return self.execute_command('RENAMENX', src, dst)
 
-
-    def set(self, name, value, **kwargs):
-        """
-        Set the value at key ``name`` to ``value``
-
-        * The following flags have been deprecated *
-        If ``preserve`` is True, set the value only if key doesn't already
-        exist
-        If ``getset`` is True, set the value only if key doesn't already exist
-        and return the resulting value of key
-        """
-        if kwargs:
-            if 'getset' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "getset option to 'set' is deprecated, "
-                    "use Redis.getset() instead"))
-                if kwargs['getset']:
-                    return self.getset(name, value)
-            if 'preserve' in kwargs:
-                warnings.warn(DeprecationWarning(
-                    "preserve option to 'set' is deprecated, "
-                    "use Redis.setnx() instead"))
-                if kwargs['preserve']:
-                    return self.setnx(name, value)
+    def set(self, name, value):
+        "Set the value at key ``name`` to ``value``"
         return self.execute_command('SET', name, value)
     __setitem__ = set
 
@@ -631,18 +513,12 @@ class Redis(threading.local):
         """
         Watches the values at keys ``names``, or None if the key doesn't exist
         """
-        if self.subscribed:
-            raise PubSubError("Can't call 'watch' when 'subscribed'")
-
         return self.execute_command('WATCH', *names)
 
     def unwatch(self):
         """
         Unwatches the value at key ``name``, or None of the key doesn't exist
         """
-        if self.subscribed:
-            raise PubSubError("Can't call 'unwatch' when 'subscribed'")
-
         return self.execute_command('UNWATCH')
 
     #### LIST COMMANDS ####
@@ -766,34 +642,6 @@ class Redis(threading.local):
         """
         return self.execute_command('LTRIM', name, start, end)
 
-    def pop(self, name, tail=False):
-        """
-        Pop and return the first or last element of list ``name``
-
-        * This method has been deprecated,
-          use Redis.lpop or Redis.rpop instead *
-        """
-        warnings.warn(DeprecationWarning(
-            "Redis.pop has been deprecated, "
-            "use Redis.lpop or Redis.rpop instead"))
-        if tail:
-            return self.rpop(name)
-        return self.lpop(name)
-
-    def push(self, name, value, head=False):
-        """
-        Push ``value`` onto list ``name``.
-
-        * This method has been deprecated,
-          use Redis.lpush or Redis.rpush instead *
-        """
-        warnings.warn(DeprecationWarning(
-            "Redis.push has been deprecated, "
-            "use Redis.lpush or Redis.rpush instead"))
-        if head:
-            return self.lpush(name, value)
-        return self.rpush(name, value)
-
     def rpop(self, name):
         "Remove and return the last item of the list ``name``"
         return self.execute_command('RPOP', name)
@@ -879,7 +727,7 @@ class Redis(threading.local):
 
     def sdiff(self, keys, *args):
         "Return the difference of sets specified by ``keys``"
-        keys = list_or_args('sdiff', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SDIFF', *keys)
 
     def sdiffstore(self, dest, keys, *args):
@@ -887,12 +735,12 @@ class Redis(threading.local):
         Store the difference of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sdiffstore', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SDIFFSTORE', dest, *keys)
 
     def sinter(self, keys, *args):
         "Return the intersection of sets specified by ``keys``"
-        keys = list_or_args('sinter', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SINTER', *keys)
 
     def sinterstore(self, dest, keys, *args):
@@ -900,7 +748,7 @@ class Redis(threading.local):
         Store the intersection of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sinterstore', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SINTERSTORE', dest, *keys)
 
     def sismember(self, name, value):
@@ -929,7 +777,7 @@ class Redis(threading.local):
 
     def sunion(self, keys, *args):
         "Return the union of sets specifiued by ``keys``"
-        keys = list_or_args('sunion', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SUNION', *keys)
 
     def sunionstore(self, dest, keys, *args):
@@ -937,14 +785,32 @@ class Redis(threading.local):
         Store the union of sets specified by ``keys`` into a new
         set named ``dest``.  Returns the number of keys in the new set.
         """
-        keys = list_or_args('sunionstore', keys, args)
+        keys = list_or_args(keys, args)
         return self.execute_command('SUNIONSTORE', dest, *keys)
 
 
     #### SORTED SET COMMANDS ####
-    def zadd(self, name, value, score):
-        "Add member ``value`` with score ``score`` to sorted set ``name``"
-        return self.execute_command('ZADD', name, score, value)
+    def zadd(self, name, value=None, score=None, **pairs):
+        """
+        For each kwarg in ``pairs``, add that item and it's score to the
+        sorted set ``name``.
+
+        The ``value`` and ``score`` arguments are deprecated.
+        """
+        all_pairs = []
+        if value is not None or score is not None:
+            if value is None or score is None:
+                raise RedisError("Both 'value' and 'score' must be specified " \
+                                 "to ZADD")
+            warnings.warn(DeprecationWarning(
+                "Passing 'value' and 'score' has been deprecated. " \
+                "Please pass via kwargs instead."))
+            all_pairs.append(score)
+            all_pairs.append(value)
+        for pair in pairs.iteritems():
+            all_pairs.append(pair[1])
+            all_pairs.append(pair[0])
+        return self.execute_command('ZADD', name, *all_pairs)
 
     def zcard(self, name):
         "Return the number of elements in the sorted set ``name``"
@@ -953,22 +819,9 @@ class Redis(threading.local):
     def zcount(self, name, min, max):
         return self.execute_command('ZCOUNT', name, min, max)
 
-    def zincr(self, key, member, value=1):
-        "This has been deprecated, use zincrby instead"
-        warnings.warn(DeprecationWarning(
-            "Redis.zincr has been deprecated, use Redis.zincrby instead"
-            ))
-        return self.zincrby(key, member, value)
-
     def zincrby(self, name, value, amount=1):
         "Increment the score of ``value`` in sorted set ``name`` by ``amount``"
         return self.execute_command('ZINCRBY', name, amount, value)
-
-    def zinter(self, dest, keys, aggregate=None):
-        warnings.warn(DeprecationWarning(
-            "Redis.zinter has been deprecated, use Redis.zinterstore instead"
-            ))
-        return self.zinterstore(dest, keys, aggregate)
 
     def zinterstore(self, dest, keys, aggregate=None):
         """
@@ -1054,7 +907,7 @@ class Redis(threading.local):
         ``start`` and ``num`` can be negative, indicating the end of the range.
 
         ``withscores`` indicates to return the scores along with the values
-        as a dictionary of value => score
+        The return type is a list of (value, score) pairs
         """
         pieces = ['ZREVRANGE', name, start, num]
         if withscores:
@@ -1093,12 +946,6 @@ class Redis(threading.local):
     def zscore(self, name, value):
         "Return the score of element ``value`` in sorted set ``name``"
         return self.execute_command('ZSCORE', name, value)
-
-    def zunion(self, dest, keys, aggregate=None):
-        warnings.warn(DeprecationWarning(
-            "Redis.zunion has been deprecated, use Redis.zunionstore instead"
-            ))
-        return self.zunionstore(dest, keys, aggregate)
 
     def zunionstore(self, dest, keys, aggregate=None):
         """
@@ -1186,17 +1033,74 @@ class Redis(threading.local):
         "Return the list of values within hash ``name``"
         return self.execute_command('HVALS', name)
 
+    def publish(self, channel, message):
+        """
+        Publish ``message`` on ``channel``.
+        Returns the number of subscribers the message was delivered to.
+        """
+        return self.execute_command('PUBLISH', channel, message)
 
-    # channels
+
+class PubSub(object):
+    """
+    PubSub provides publish, subscribe and listen support to Redis channels.
+
+    After subscribing to one or more channels, the listen() method will block
+    until a message arrives on one of the subscribed channels. That message
+    will be returned and it's safe to start listening again.
+    """
+    def __init__(self, connection_pool, shard_hint=None):
+        self.connection_pool = connection_pool
+        self.shard_hint = shard_hint
+        self.connection = None
+        self.channels = set()
+        self.patterns = set()
+        self.subscription_count = 0
+        self.subscribe_commands = set(
+            ('subscribe', 'psubscribe', 'unsubscribe', 'punsubscribe')
+            )
+
+    def execute_command(self, *args, **kwargs):
+        "Execute a publish/subscribe command"
+        if self.connection is None:
+            self.connection = self.connection_pool.get_connection(
+                'pubsub',
+                self.shard_hint
+                )
+        connection = self.connection
+        try:
+            connection.send_command(*args)
+            return self.parse_response()
+        except ConnectionError:
+            connection.disconnect()
+            # resubscribe to all channels and patterns before
+            # resending the current command
+            for channel in self.channels:
+                self.subscribe(channel)
+            for pattern in self.patterns:
+                self.psubscribe(pattern)
+            connection.send_command(*args)
+            return self.parse_response()
+
+    def parse_response(self):
+        "Parse the response from a publish/subscribe command"
+        response = self.connection.read_response()
+        if response[0] in self.subscribe_commands:
+            self.subscription_count = response[2]
+            # if we've just unsubscribed from the remaining channels,
+            # release the connection back to the pool
+            if not self.subscription_count:
+                self.connection_pool.release(self.connection)
+                self.connection = None
+        return response
+
     def psubscribe(self, patterns):
         "Subscribe to all channels matching any pattern in ``patterns``"
         if isinstance(patterns, basestring):
             patterns = [patterns]
-        response = self.execute_command('PSUBSCRIBE', *patterns)
-        # this is *after* the SUBSCRIBE in order to allow for lazy and broken
-        # connections that need to issue AUTH and SELECT commands
-        self.subscribed = True
-        return response
+        for pattern in patterns:
+            self.patterns.add(pattern)
+        return self.execute_command('PSUBSCRIBE', *patterns)
 
     def punsubscribe(self, patterns=[]):
         """
@@ -1205,17 +1109,20 @@ class Redis(threading.local):
         """
         if isinstance(patterns, basestring):
             patterns = [patterns]
+        for pattern in patterns:
+            try:
+                self.patterns.remove(pattern)
+            except KeyError:
+                pass
         return self.execute_command('PUNSUBSCRIBE', *patterns)
 
     def subscribe(self, channels):
         "Subscribe to ``channels``, waiting for messages to be published"
         if isinstance(channels, basestring):
             channels = [channels]
-        response = self.execute_command('SUBSCRIBE', *channels)
-        # this is *after* the SUBSCRIBE in order to allow for lazy and broken
-        # connections that need to issue AUTH and SELECT commands
-        self.subscribed = True
-        return response
+        for channel in channels:
+            self.channels.add(channel)
+        return self.execute_command('SUBSCRIBE', *channels)
 
     def unsubscribe(self, channels=[]):
         """
@@ -1224,6 +1131,11 @@ class Redis(threading.local):
         """
         if isinstance(channels, basestring):
             channels = [channels]
+        for channel in channels:
+            try:
+                self.channels.remove(channel)
+            except KeyError:
+                pass
         return self.execute_command('UNSUBSCRIBE', *channels)
 
     def publish(self, channel, message):
@@ -1235,24 +1147,22 @@ class Redis(threading.local):
 
     def listen(self):
         "Listen for messages on channels this client has been subscribed to"
-        while self.subscribed:
-            r = self.parse_response('LISTEN')
+        while self.subscription_count:
+            r = self.parse_response()
             if r[0] == 'pmessage':
                 msg = {
-                'type': r[0],
-                'pattern': r[1],
-                'channel': r[2],
-                'data': r[3]
+                    'type': r[0],
+                    'pattern': r[1],
+                    'channel': r[2],
+                    'data': r[3]
                 }
             else:
                 msg = {
-                'type': r[0],
-                'pattern': None,
-                'channel': r[1],
-                'data': r[2]
+                    'type': r[0],
+                    'pattern': None,
+                    'channel': r[1],
+                    'data': r[2]
                 }
-            if r[0] == 'unsubscribe' and r[2] == 0:
-                self.subscribed = False
             yield msg
 
 
@@ -1274,18 +1184,20 @@ class Pipeline(Redis):
     ResponseError exceptions, such as those raised when issuing a command
     on a key of a different datatype.
     """
-    def __init__(self, connection, transaction, charset, errors):
-        self.connection = connection
+    def __init__(self, connection_pool, response_callbacks, transaction,
+                 shard_hint):
+        self.connection_pool = connection_pool
+        self.response_callbacks = response_callbacks
         self.transaction = transaction
-        self.encoding = charset
-        self.errors = errors
-        self.subscribed = False # NOTE not in use, but necessary
+        self.shard_hint = shard_hint
         self.reset()
 
     def reset(self):
         self.command_stack = []
+        if self.transaction:
+            self.execute_command('MULTI')
 
-    def _execute_command(self, command_name, command, **options):
+    def execute_command(self, *args, **options):
         """
         Stage a command to be executed when execute() is next called
 
@@ -1297,74 +1209,70 @@ class Pipeline(Redis):
         At some other point, you can then run: pipe.execute(),
         which will execute all commands queued in the pipe.
         """
-        # if the command_name is 'AUTH' or 'SELECT', then this command
-        # must have originated after a socket connection and a call to
-        # _setup_connection(). run these commands immediately without
-        # buffering them.
-        if command_name in ('AUTH', 'SELECT'):
-            return super(Pipeline, self)._execute_command(
-                command_name, command, **options)
-        else:
-            self.command_stack.append((command_name, command, options))
+        self.command_stack.append((args, options))
         return self
 
     def _execute_transaction(self, commands):
-        # wrap the commands in MULTI ... EXEC statements to indicate an
-        # atomic operation
-        all_cmds = ''.join([c for _1, c, _2 in chain(
-            (('', 'MULTI\r\n', ''),),
-            commands,
-            (('', 'EXEC\r\n', ''),)
-            )])
-        self.connection.send(all_cmds, self)
-        # parse off the response for MULTI and all commands prior to EXEC
-        for i in range(len(commands)+1):
-            _ = self.parse_response('_')
-        # parse the EXEC. we want errors returned as items in the response
-        response = self.parse_response('_', catch_errors=True)
+        conn = self.connection_pool.get_connection('MULTI', self.shard_hint)
+        try:
+            all_cmds = ''.join(starmap(conn.pack_command,
+                                       [args for args, options in commands]))
+            conn.send_packed_command(all_cmds)
+            # we don't care about the multi/exec any longer
+            commands = commands[1:-1]
+            # parse off the response for MULTI and all commands prior to EXEC.
+            # the only data we care about is the response the EXEC
+            # which is the last command
+            for i in range(len(commands)+1):
+                _ = self.parse_response(conn, '_')
+            # parse the EXEC.
+            response = self.parse_response(conn, '_')
 
-        if response is None:
-            raise WatchError("Watched variable changed.")
+            if response is None:
+                raise WatchError("Watched variable changed.")
 
-        if len(response) != len(commands):
-            raise ResponseError("Wrong number of response items from "
-                "pipeline execution")
-        # Run any callbacks for the commands run in the pipeline
-        data = []
-        for r, cmd in izip(response, commands):
-            if not isinstance(r, Exception):
-                if cmd[0] in self.RESPONSE_CALLBACKS:
-                    r = self.RESPONSE_CALLBACKS[cmd[0]](r, **cmd[2])
-            data.append(r)
-        return data
+            if len(response) != len(commands):
+                raise ResponseError("Wrong number of response items from "
+                    "pipeline execution")
+            # We have to run response callbacks manually
+            data = []
+            for r, cmd in izip(response, commands):
+                if not isinstance(r, Exception):
+                    args, options = cmd
+                    command_name = args[0]
+                    if command_name in self.response_callbacks:
+                        r = self.response_callbacks[command_name](r, **options)
+                data.append(r)
+            return data
+        finally:
+            self.connection_pool.release(conn)
 
     def _execute_pipeline(self, commands):
         # build up all commands into a single request to increase network perf
-        all_cmds = ''.join([c for _1, c, _2 in commands])
-        self.connection.send(all_cmds, self)
-        data = []
-        for command_name, _, options in commands:
-            data.append(
-                self.parse_response(command_name, catch_errors=True, **options)
-                )
-        return data
+        conn = self.connection_pool.get_connection('MULTI', self.shard_hint)
+        try:
+            all_cmds = ''.join(starmap(conn.pack_command,
+                                       [args for args, options in commands]))
+            conn.send_packed_command(all_cmds)
+            return [self.parse_response(conn, args[0], **options)
+                    for args, options in commands]
+        finally:
+            self.connection_pool.release(conn)
 
     def execute(self):
         "Execute all the commands in the current pipeline"
-        stack = self.command_stack
-        self.reset()
         if self.transaction:
+            self.execute_command('EXEC')
             execute = self._execute_transaction
         else:
             execute = self._execute_pipeline
+        stack = self.command_stack
+        self.reset()
         try:
             return execute(stack)
         except ConnectionError:
-            self.connection.disconnect()
+            connection.disconnect()
             return execute(stack)
-
-    def select(self, *args, **kwargs):
-        raise RedisError("Cannot select a different database from a pipeline")
 
 class LockError(RedisError):
     "Errors thrown from the Lock"

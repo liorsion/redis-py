@@ -11,7 +11,7 @@ class PipelineTestCase(unittest.TestCase):
 
     def test_pipeline(self):
         pipe = self.client.pipeline()
-        pipe.set('a', 'a1').get('a').zadd('z', 'z1', 1).zadd('z', 'z2', 4)
+        pipe.set('a', 'a1').get('a').zadd('z', z1=1).zadd('z', z2=4)
         pipe.zincrby('z', 'z1').zrange('z', 0, 5, withscores=True)
         self.assertEquals(pipe.execute(),
             [
@@ -45,11 +45,6 @@ class PipelineTestCase(unittest.TestCase):
         # make sure the pipe was restored to a working state
         self.assertEquals(pipe.set('z', 'zzz').execute(), [True])
         self.assertEquals(self.client['z'], 'zzz')
-
-    def test_pipeline_cannot_select(self):
-        pipe = self.client.pipeline()
-        self.assertRaises(redis.RedisError,
-            pipe.select, 'localhost', 6379, db=9)
 
     def test_pipeline_no_transaction(self):
         pipe = self.client.pipeline(transaction=False)
