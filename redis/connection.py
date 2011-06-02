@@ -47,6 +47,12 @@ class BaseConnection(object):
             self._sock.close()
         except socket.error:
             pass
+        
+        try:
+            self._fp.close()
+        except:
+            pass
+        
         self._sock = None
         self._fp = None
 
